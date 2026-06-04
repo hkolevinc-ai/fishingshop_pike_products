@@ -1,16 +1,16 @@
-name: Python check
+name: Run scraper
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+  push:
 
 jobs:
-  check:
+  scrape:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,6 +22,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Syntax check
+      - name: Run scraper
         run: |
-          python -m compileall .
+          python main.py --discover-categories --max-pages 5 --delay 1.5
+
+      - name: Upload CSV result
+        uses: actions/upload-artifact@v4
+        with:
+          name: fishingshop-pike-products-csv
+          path: fishingshop_pike_products.csv
+
+      - name: Upload JSONL result
+        uses: actions/upload-artifact@v4
+        with:
+          name: fishingshop-pike-products-jsonl
+          path: fishingshop_pike_products.jsonl
