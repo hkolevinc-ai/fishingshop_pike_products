@@ -24,7 +24,7 @@ jobs:
 
       - name: Run scraper
         run: |
-          python main.py --discover-categories --max-pages 5 --delay 1.5
+          python main.py --start https://fishingshop-pike.com/category/383/prati.html --max-pages 1 --delay 1.5
 
       - name: Upload CSV result
         uses: actions/upload-artifact@v4
