@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Scraper output
+*.csv
+*.jsonl
+
+# OS
+.DS_Store
+Thumbs.db
