@@ -254,118 +254,146 @@ class PikeScraper:
         return ""
 
     def _extract_category(self, soup: BeautifulSoup, product_name: str) -> str:
-        # На този SELITON сайт breadcrumb-ът е: Начало > Категория > Име на продукт.
-        # Взимаме само линковете към категории от зоната преди H1.
-        h1 = soup.find("h1")
-        category_labels: list[str] = []
+        """Извлича категория само от breadcrumb-а, без да дърпа цялото меню."""
+        labels: list[str] = []
 
-        if h1:
-            for element in h1.find_all_previous("a", href=True):
-                href = element.get("href", "")
-                label = self.clean(element.get_text(" "))
-                if label and "category/" in href:
-                    category_labels.append(label)
-            category_labels.reverse()
+        # 1) Най-точно: JSON-LD BreadcrumbList.
+        for script in soup.find_all("script", type="application/ld+json"):
+            raw = script.string or script.get_text(" ")
+            if not raw or "BreadcrumbList" not in raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
 
-        if not category_labels:
-            for a in soup.select("a[href*='/category/']"):
+            items = data.get("itemListElement", []) if isinstance(data, dict) else []
+            for item in items:
+                node = item.get("item", {}) if isinstance(item, dict) else {}
+                name = self.clean(node.get("name", "") if isinstance(node, dict) else "")
+                item_url = node.get("@id", "") if isinstance(node, dict) else ""
+                if name and name.lower() != "начало" and "/category/" in item_url:
+                    labels.append(name)
+
+        # 2) DOM breadcrumb fallback.
+        if not labels:
+            for a in soup.select(".c-breadcrumb a[href*='/category/'], .c-breadcrumb__list a[href*='/category/']"):
                 label = self.clean(a.get_text(" "))
                 if label and label != product_name:
-                    category_labels.append(label)
+                    labels.append(label)
 
-        # Премахване на дублирания, запазвайки реда.
+        # 3) По-широк fallback, но само около product-page, не от главното меню.
+        if not labels:
+            product_page = soup.select_one("#product-page, .c-page-product")
+            if product_page:
+                for a in product_page.select("a[href*='/category/']"):
+                    label = self.clean(a.get_text(" "))
+                    if label and label != product_name:
+                        labels.append(label)
+
         seen: set[str] = set()
-        unique = [x for x in category_labels if not (x in seen or seen.add(x))]
+        unique = [x for x in labels if not (x in seen or seen.add(x))]
         return " > ".join(unique)
 
+    def _text_from_node(self, node) -> str:
+        """Вади четим текст от HTML node, като пази br/параграфите като разделители."""
+        if not node:
+            return ""
+        # Сменяме br с разделител, за да не се слепват редовете в Excel.
+        for br in node.find_all("br"):
+            br.replace_with(" | ")
+        value = node.get_text(" ", strip=True)
+        value = value.replace("\xa0", " ")
+        value = re.sub(r"\s*\|\s*", " | ", value)
+        value = re.sub(r"(?:\s*\|\s*){2,}", " | ", value)
+        return self._clean_description(value)
+
     def _clean_description(self, value: str) -> str:
+        value = value.replace("\xa0", " ")
         value = self.clean(value)
         value = re.sub(r"^(?:Описание\s*)+", "", value, flags=re.I).strip()
         value = re.sub(r"\s*OК\s*$", "", value, flags=re.I).strip()
         value = re.sub(r"\s*OK\s*$", "", value, flags=re.I).strip()
         return value
 
+    def _add_description_candidate(self, descriptions: list[str], candidate: str) -> None:
+        candidate = self._clean_description(candidate)
+        if not candidate or len(candidate) < 10:
+            return
+
+        # Премахване на очевидни SEO/meta текстове и UI боклуци.
+        bad_markers = (
+            "риболовен магазин,рибарски магазин",
+            "Бързи връзки:",
+            "Информация за контакти:",
+            "Само попълнете 2 полета",
+            "Ние ще се свържем",
+            "Добави в количка",
+            "Добави в желани",
+            "Оцени продукта",
+            "Изпрати на приятел",
+        )
+        if any(marker.lower() in candidate.lower() for marker in bad_markers):
+            return
+
+        # Не добавяме дублирани или вложени варианти.
+        for existing in descriptions:
+            if candidate == existing or candidate in existing:
+                return
+        descriptions[:] = [existing for existing in descriptions if existing not in candidate]
+        descriptions.append(candidate)
+
     def _extract_description(self, soup: BeautifulSoup, full_text: str) -> str:
         """
-        Извлича описание максимално агресивно.
+        Извлича пълно описание от продуктовата страница.
 
-        При този SELITON шаблон има два възможни типа описание:
-        1) кратко описание веднага след „Код:“ и преди наличността;
-        2) дълго описание в таб/секция „Описание“.
+        При този SELITON шаблон има две отделни места:
+        1) кратко описание в горния продуктов блок:
+           .c-product-page__product-description.description
+        2) дълго описание в таба:
+           #product-more-description-... / .c-tab__detailed-description
 
-        Старият вариант често изпускаше първия тип, затова тук събираме и двата.
+        Предишният вариант често взимаше само краткото описание, затова тук
+        първо четем точните DOM контейнери и ги обединяваме.
         """
         descriptions: list[str] = []
 
-        # 1) Дълго описание от таба/секцията „Описание“.
-        # Използваме последното срещане на „Описание“, за да избегнем менюта/линкове
-        # към таба в горната част на страницата.
-        marker_positions = [m.start() for m in re.finditer(r"\bОписание\b", full_text, re.I)]
-        for pos in reversed(marker_positions):
-            candidate = full_text[pos:]
-            candidate = re.split(
-                r"\s*(?:Бързи връзки:|Информация за контакти:|Изпрати на приятел|Оцени продукта|Сравни)\s*",
-                candidate,
-                maxsplit=1,
-                flags=re.I,
-            )[0]
-            candidate = self._clean_description(candidate)
-            if len(candidate) > 30 and candidate.lower() != "описание":
-                descriptions.append(candidate)
-                break
+        # 1) Кратко описание под кода/цената.
+        for selector in (
+            ".c-product-page__product-description.description",
+            ".c-product-page__product-description[itemprop='description']",
+            ".c-product-page__product-description",
+        ):
+            for node in soup.select(selector):
+                self._add_description_candidate(descriptions, self._text_from_node(node))
 
-        # 2) Кратко описание от основния продуктов блок — между кода и наличността.
-        short_patterns = [
-            r"Код:\s*[\w\-\.\/]+\s+(.*?)\s*(?:✔\s*)?В наличност",
-            r"Код:\s*[\w\-\.\/]+\s+(.*?)\s*(?:Изчерпан|Няма наличност|Не е наличен)",
-            r"Цена:.*?лв\.?\s+[0-9.,]+\s*EUR\s+Код:\s*[\w\-\.\/]+\s+(.*?)\s*(?:✔\s*)?В наличност",
-        ]
-        for pattern in short_patterns:
-            match = re.search(pattern, full_text, re.I | re.S)
-            if match:
-                candidate = self._clean_description(match.group(1))
-                # Премахваме очевидни UI фрагменти, ако са попаднали в блока.
+        # 2) Дълго описание от таба „Описание“.
+        for selector in (
+            "[id^='product-more-description'] .s-html-editor",
+            "[id^='product-more-description']",
+            ".c-tab__detailed-description .s-html-editor",
+            ".c-tab__detailed-description",
+            ".tab-content .s-html-editor",
+        ):
+            for node in soup.select(selector):
+                self._add_description_candidate(descriptions, self._text_from_node(node))
+
+        # 3) Fallback: ако DOM селекторите не сработят, търсим след последния tab-content.
+        if not descriptions:
+            marker_positions = [m.start() for m in re.finditer(r"\bОписание\b", full_text, re.I)]
+            for pos in reversed(marker_positions):
+                candidate = full_text[pos:]
                 candidate = re.split(
-                    r"\s*(?:Добавен в Желани|Добави в желани|Бърза поръчка|Само попълнете|Изпрати на приятел)\s*",
+                    r"\s*(?:Бързи връзки:|Информация за контакти:|Изпрати на приятел|Оцени продукта|Сравни)\s*",
                     candidate,
                     maxsplit=1,
                     flags=re.I,
-                )[0].strip()
-                if len(candidate) > 20:
-                    descriptions.append(candidate)
+                )[0]
+                self._add_description_candidate(descriptions, candidate)
+                if descriptions:
                     break
 
-        # 3) DOM fallback: търсим контейнери около h2/таб „Описание“.
-        if not descriptions:
-            header = soup.find(string=re.compile(r"^\s*Описание\s*$", re.I))
-            if header:
-                parent = header.find_parent()
-                candidates = []
-                if parent:
-                    candidates.extend(parent.find_all_next(limit=12))
-                for candidate_node in candidates:
-                    candidate_text = self._clean_description(candidate_node.get_text(" "))
-                    if (
-                        candidate_text
-                        and "Бързи връзки:" not in candidate_text
-                        and candidate_text.lower() != "описание"
-                        and len(candidate_text) > 30
-                    ):
-                        descriptions.append(candidate_text)
-                        break
-
-        # Премахване на дублирани/вложени описания, запазвайки реда.
-        result: list[str] = []
-        for desc in descriptions:
-            if not desc:
-                continue
-            if any(desc == existing or desc in existing for existing in result):
-                continue
-            if any(existing in desc for existing in result):
-                result = [existing for existing in result if existing not in desc]
-            result.append(desc)
-
-        return " | ".join(result)
+        return " | ".join(descriptions)
 
     def _extract_image_urls(self, soup: BeautifulSoup, product_url: str, product_name: str) -> list[str]:
         urls: list[str] = []
