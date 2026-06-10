@@ -1,0 +1,14 @@
+[project]
+name = "fishingshop-pike-scraper"
+version = "1.0.0"
+description = "Python scraper for fishingshop-pike.com products"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.0.0",
+]
+
+[project.scripts]
+pike-scraper = "fishingshop_pike_scraper.scraper:main"
